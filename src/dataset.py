@@ -2,6 +2,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
+from sklearn.preprocessing import OneHotEncoder
 
 
 class ATPMatchesDataset(Dataset):
@@ -14,8 +15,39 @@ class ATPMatchesDataset(Dataset):
         self.matches_df = pd.read_csv(csv_file)
         self.transform = transform
 
-        # Clean data - remove rows with missing critical values
-        self.matches_df = self.matches_df.dropna(subset=['winner_rank', 'loser_rank'])
+        # we dont want nones here
+        self.matches_df = self.matches_df.dropna()
+
+        # Initialize OneHotEncoder for surface
+        self.surface_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        # Fit on all possible surfaces
+        surfaces = self.matches_df['surface'].values.reshape(-1, 1)
+        self.surface_encoder.fit(surfaces)
+
+        # Initialize OneHotEncoder for tourney_level
+        self.level_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        # Fit on all possible tourney levels
+        levels = self.matches_df['tourney_level'].values.reshape(-1, 1)
+        self.level_encoder.fit(levels)
+
+        # Initialize OneHotEncoder for best_of
+        self.best_of_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        best_of_values = self.matches_df['best_of'].values.reshape(-1, 1)
+        self.best_of_encoder.fit(best_of_values)
+
+        # Initialize OneHotEncoder for round
+        self.round_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        rounds = self.matches_df['round'].values.reshape(-1, 1)
+        self.round_encoder.fit(rounds)
+
+        # Initialize OneHotEncoder for IOC (both winner and loser)
+        self.ioc_encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        # Combine all IOC values from both winner and loser columns
+        all_iocs = np.concatenate([
+            self.matches_df['winner_ioc'].values,
+            self.matches_df['loser_ioc'].values
+        ]).reshape(-1, 1)
+        self.ioc_encoder.fit(all_iocs)
 
     def __len__(self):
         return len(self.matches_df)
@@ -27,30 +59,58 @@ class ATPMatchesDataset(Dataset):
         match = self.matches_df.iloc[idx]
 
         # Create features for both players
+        # OneHot encode winner_ioc and loser_ioc using unified encoder
+        winner_ioc_onehot = self.ioc_encoder.transform([[match['winner_ioc']]])[0]
+        loser_ioc_onehot = self.ioc_encoder.transform([[match['loser_ioc']]])[0]
+
         winner_features = [
-            match['winner_rank'] if pd.notna(match['winner_rank']) else 1000,
-            match['winner_age'] if pd.notna(match['winner_age']) else 25,
-            match['winner_ht'] if pd.notna(match['winner_ht']) else 180,
-            1 if match['winner_hand'] == 'R' else 0 if pd.notna(match['winner_hand']) else 0.5
-        ]
+            match['winner_rank'],
+            match['winner_age'],
+            match['winner_ht'],
+            1 if match['winner_hand'] == 'R' else 0,
+            match['w_ace_avg'],
+            match['w_df_avg'],
+            match['w_svpt_avg'],
+            match['w_1stIn_avg'],
+            match['w_1stWon_avg'],
+            match['w_2ndWon_avg'],
+            match['w_SvGms_avg'],
+            match['w_bpSaved_avg'],
+            match['w_bpFaced_avg']
+        ] + winner_ioc_onehot.tolist()
 
         loser_features = [
-            match['loser_rank'] if pd.notna(match['loser_rank']) else 1000,
-            match['loser_age'] if pd.notna(match['loser_age']) else 25,
-            match['loser_ht'] if pd.notna(match['loser_ht']) else 180,
-            1 if match['loser_hand'] == 'R' else 0 if pd.notna(match['loser_hand']) else 0.5
-        ]
+            match['loser_rank'],
+            match['loser_age'],
+            match['loser_ht'],
+            1 if match['loser_hand'] == 'R' else 0,
+            match['l_ace_avg'],
+            match['l_df_avg'],
+            match['l_svpt_avg'],
+            match['l_1stIn_avg'],
+            match['l_1stWon_avg'],
+            match['l_2ndWon_avg'],
+            match['l_SvGms_avg'],
+            match['l_bpSaved_avg'],
+            match['l_bpFaced_avg']
+        ] + loser_ioc_onehot.tolist()
 
         # Match context features
-        surface_encoding = {'Hard': 0, 'Clay': 1, 'Grass': 2}
-        surface = surface_encoding.get(match['surface'], 0)
+        # OneHot encode surface
+        surface_onehot = self.surface_encoder.transform([[match['surface']]])[0]
 
-        level_encoding = {'G': 4, 'M': 3, 'A': 2, 'D': 1, 'F': 0}
-        level = level_encoding.get(match['tourney_level'], 1)
+        # OneHot encode tourney_level
+        level_onehot = self.level_encoder.transform([[match['tourney_level']]])[0]
+
+        # OneHot encode best_of
+        best_of_onehot = self.best_of_encoder.transform([[match['best_of']]])[0]
+
+        # OneHot encode round
+        round_onehot = self.round_encoder.transform([[match['round']]])[0]
 
         # Combine all features
         feature_tensor = torch.tensor(
-            winner_features + loser_features + [surface, level],
+            winner_features + loser_features + surface_onehot.tolist() + level_onehot.tolist() + best_of_onehot.tolist() + round_onehot.tolist(),
             dtype=torch.float32
         )
 
@@ -63,7 +123,7 @@ class ATPMatchesDataset(Dataset):
         else:
             # Swap players - loser becomes player 1
             feature_tensor = torch.tensor(
-                loser_features + winner_features + [surface, level],
+                loser_features + winner_features + surface_onehot.tolist() + level_onehot.tolist() + best_of_onehot.tolist() + round_onehot.tolist(),
                 dtype=torch.float32
             )
             target = torch.tensor(0, dtype=torch.long)
@@ -76,5 +136,10 @@ class ATPMatchesDataset(Dataset):
         return sample
 
 # Usage example
-# dataset = ATPMatchesDataset('tennis_atp/atp_matches_2019.csv')
+# dataset = ATPMatchesDataset('../data/processed/atp_matches_2000_2024_final.csv')
 # dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+#
+# for batch in dataloader:
+#     features = batch['features']
+#     targets = batch['target']
+#     print(features.size(), targets.size())
