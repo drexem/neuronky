@@ -1,269 +1,302 @@
 from src.dataset import ATPMatchesDataset
 from torch.utils.data import DataLoader
-from torch.utils.data import random_split
-import torch.nn as nn
-
 import torch
-import torch.optim as optim
-import pickle
-import os
+import torch.nn as nn
+import numpy as np
+import random
 
-if __name__ == '__main__':
-    print("Started training script.")
+# =========================
+# Reproducibility
+# =========================
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+np.random.seed(42)
+random.seed(42)
 
-    dataset = ATPMatchesDataset('data/processed/atp_matches_2000_2024_final.csv')
+# =========================
+# Models
+# =========================
 
-    num_workers = 2
-    train_loader = DataLoader(dataset.TRAIN, batch_size=32, shuffle=True, num_workers=num_workers)
-    dev_loader = DataLoader(dataset.DEV, batch_size=32, shuffle=False, num_workers=num_workers)
-    test_loader = DataLoader(dataset.TEST, batch_size=32, shuffle=False, num_workers=num_workers)
+class MLPBatchNorm(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64]):
+        super().__init__()
+        layers = []
+        prev = input_size
+        for h in hidden_sizes:
+            layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+            prev = h
+        layers.append(nn.Linear(prev, 1))
+        self.net = nn.Sequential(*layers)
 
-    class ATPMatchPredictor(nn.Module):
-        def __init__(self, net : torch.nn.Sequential):
-            super(ATPMatchPredictor, self).__init__()
-
-            self.network = net
-
-        def forward(self, x):
-            return self.network(x)
-
-    # Check if CUDA is available and set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-
-    # Get input size from first batch
-    sample_batch = next(iter(train_loader))
-    features = sample_batch['features']
-    labels = sample_batch['target']
-    input_size = features.shape[1]
-
-    print(f"Input size: {input_size}")
+    def forward(self, x):
+        return self.net(x).squeeze(1)
 
 
-    hidden_sizes=[128, 64, 32]
-    layers = []
-    prev_size = input_size
-    for hidden_size in hidden_sizes:
-        layers.append(nn.Linear(prev_size, hidden_size))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(0.3))
-        prev_size = hidden_size
+class ResidualBlock(nn.Module):
+    def __init__(self, size):
+        super().__init__()
+        self.fc1 = nn.Linear(size, size)
+        self.bn1 = nn.BatchNorm1d(size)
+        self.fc2 = nn.Linear(size, size)
+        self.bn2 = nn.BatchNorm1d(size)
 
-    # Output layer (binary classification)
-    layers.append(nn.Linear(prev_size, 1))
-    first_arch = nn.Sequential(*layers)
+    def forward(self, x):
+        r = x
+        x = torch.relu(self.bn1(self.fc1(x)))
+        x = self.bn2(self.fc2(x))
+        return torch.relu(x + r)
 
 
-    architectures = [
-        first_arch,
-        nn.Sequential(
-                    nn.Linear(input_size, 256),
-                    nn.BatchNorm1d(256),
-                    nn.GELU(),
-                    nn.Dropout(0.15),
+class ResidualMLP(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_blocks=3):
+        super().__init__()
+        self.input = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.ReLU()
+        )
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(hidden_size) for _ in range(num_blocks)]
+        )
+        self.output = nn.Linear(hidden_size, 1)
 
-                    nn.Linear(256, 128),
-                    nn.BatchNorm1d(128),
-                    nn.GELU(),
-                    nn.Dropout(0.15),
+    def forward(self, x):
+        x = self.input(x)
+        x = self.blocks(x)
+        return self.output(x).squeeze(1)
 
-                    nn.Linear(128, 64),
-                    nn.BatchNorm1d(64),
-                    nn.GELU(),
 
-                    nn.Linear(64, 1)
-                ),
-        # Deep residual-style network
-        nn.Sequential(
-            nn.Linear(input_size, 512),
-            nn.BatchNorm1d(512),
+class DifferenceModel(nn.Module):
+    def __init__(self, player_size, match_size):
+        super().__init__()
+        self.player_size = player_size
+        self.match_size = match_size
+        self.net = nn.Sequential(
+            nn.Linear(player_size + match_size, 64),
             nn.ReLU(),
-            nn.Dropout(0.25),
-
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.Linear(32, 1)
+        )
 
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(0.15),
+    def forward(self, x):
+        p1 = x[:, :self.player_size]
+        p2 = x[:, self.player_size:2 * self.player_size]
+        match = x[:, 2 * self.player_size:2 * self.player_size + self.match_size]
 
-            nn.Linear(128, 64),
+        diff = (p1 - p2) / (p1.abs() + p2.abs() + 1e-6)
+        return self.net(torch.cat([diff, match], dim=1)).squeeze(1)
+
+# celkom dobre to funguje nad 66 vsetko
+# class DifferenceModelBN(nn.Module):
+#     def __init__(self, player_size, match_size, dropout=0.5):
+#         super().__init__()
+#         self.player_size = player_size
+#         self.match_size = match_size
+#
+#         self.net = nn.Sequential(
+#             nn.Linear(player_size + match_size, 64),
+#             nn.BatchNorm1d(64),
+#             nn.ReLU(),
+#             nn.Dropout(dropout),
+#
+#             nn.Linear(64, 32),
+#             nn.BatchNorm1d(32),
+#             nn.ReLU(),
+#
+#             nn.Linear(32, 1)
+#         )
+#
+#     def forward(self, x):
+#         p1 = x[:, :self.player_size]
+#         p2 = x[:, self.player_size:2 * self.player_size]
+#         match = x[:, 2 * self.player_size:2 * self.player_size + self.match_size]
+#
+#         diff = (p1 - p2) / (p1.abs() + p2.abs() + 1e-6)
+#         return self.net(torch.cat([diff, match], dim=1)).squeeze(1)
+
+class DifferenceModelBN(nn.Module):
+    def __init__(self, player_size, match_size, dropout=0.45):
+        super().__init__()
+        self.player_size = player_size
+        self.match_size = match_size
+
+        self.net = nn.Sequential(
+            nn.Linear(player_size + match_size, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(),
+            nn.Dropout(dropout),
 
-            nn.Linear(64, 1)
-        ),
-        # Wide shallow network
-        nn.Sequential(
-            nn.Linear(input_size, 384),
-            nn.BatchNorm1d(384),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.3),
-
-            nn.Linear(384, 192),
-            nn.BatchNorm1d(192),
-            nn.LeakyReLU(0.1),
-
-            nn.Linear(192, 1)
-        ),
-        # Funnel architecture with smaller dropouts
-        nn.Sequential(
-            nn.Linear(input_size, 320),
-            nn.BatchNorm1d(320),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(320, 160),
-            nn.BatchNorm1d(160),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(160, 80),
-            nn.BatchNorm1d(80),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-
-            nn.Linear(80, 40),
-            nn.BatchNorm1d(40),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
 
-            nn.Linear(40, 1)
-        ),
-        # Narrow deep network
-        nn.Sequential(
-            nn.Linear(input_size, 256),
-            nn.BatchNorm1d(256),
-            nn.ELU(),
-            nn.Dropout(0.2),
-
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
-            nn.ELU(),
-            nn.Dropout(0.2),
-
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ELU(),
-            nn.Dropout(0.15),
-
-            nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
-            nn.ELU(),
-
-            nn.Linear(128, 1)
-        ),
-        # Aggressive dropout network
-        nn.Sequential(
-            nn.Linear(input_size, 400),
-            nn.BatchNorm1d(400),
-            nn.ReLU(),
-            nn.Dropout(0.4),
-
-            nn.Linear(400, 200),
-            nn.BatchNorm1d(200),
-            nn.ReLU(),
-            nn.Dropout(0.35),
-
-            nn.Linear(200, 100),
-            nn.BatchNorm1d(100),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-
-            nn.Linear(100, 1)
+            nn.Linear(32, 1)
         )
-    ]
 
-    num_epochs = 50
+    def forward(self, x):
+        p1 = x[:, :self.player_size]
+        p2 = x[:, self.player_size:2 * self.player_size]
+        match = x[:, 2 * self.player_size:2 * self.player_size + self.match_size]
 
-    optimizer_classes = [
-        optim.AdamW,
-        optim.SGD,
-        # Add more optimizers if needed
-    ]
+        diff = (p1 - p2) / (p1.abs() + p2.abs() + 1e-6)
+        return self.net(torch.cat([diff, match], dim=1)).squeeze(1)
+class PlayerEncoder(nn.Module):
+    def __init__(self, player_size, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(player_size, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU()
+        )
 
-    scheduler_classes = [
-        lambda opt: optim.lr_scheduler.CosineAnnealingLR(opt, T_max=num_epochs),
-        lambda opt: optim.lr_scheduler.StepLR(opt, step_size=10, gamma=0.1),
-        # Add more schedulers if needed
-    ]
-
-
-    for arch_idx, arch in enumerate(architectures):
-        for opt_idx, opt_cls in enumerate(optimizer_classes):
-            for sched_idx, sched_fn in enumerate(scheduler_classes):
-                print(
-                    f"Testing architecture {arch_idx}, optimizer {opt_cls.__name__}, scheduler {sched_fn.__name__ if hasattr(sched_fn, '__name__') else sched_fn}")
-                model = ATPMatchPredictor(arch).to(device)
-                optimizer = opt_cls(model.parameters(), lr=3e-4, weight_decay=1e-4)
-                scheduler = sched_fn(optimizer)
-
-                # Loss and optimizer
-                criterion = nn.BCEWithLogitsLoss()
-
-                for epoch in range(num_epochs):
-                    model.train()
-                    train_loss = 0.0
-
-                    for batch in train_loader:
-                        features = batch['features'].to(device)  # Move to device
-                        labels = batch['target'].float().to(device)  # Move to device
-
-                        # Forward pass
-                        outputs = model(features)
-                        loss = criterion(outputs.squeeze(), labels)
-
-                        # Backward pass
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-
-                        train_loss += loss.item()
-
-                    # Validation
-                    model.eval()
-                    dev_loss = 0.0
-                    correct = 0
-                    total = 0
-
-                    with torch.no_grad():
-                        for batch in dev_loader:
-                            features = batch['features'].to(device)  # Move to device
-                            labels = batch['target'].float().to(device)
-
-                            outputs = model(features)
-                            loss = criterion(outputs.squeeze(), labels)
-                            dev_loss += loss.item()
-
-                            predicted = (outputs.squeeze() > 0.5).float()
-                            correct += (predicted == labels).sum().item()
-                            total += labels.size(0)
-
-                    accuracy = 100 * correct / total
-                    print(f'Epoch [{epoch+1}/{num_epochs}], '
-                          f'Train Loss: {train_loss/len(train_loader):.4f}, '
-                          f'Dev Loss: {dev_loss/len(dev_loader):.4f}, '
-                          f'Dev Accuracy: {accuracy:.2f}%')
+    def forward(self, x):
+        return self.net(x)
 
 
+class SymmetricMatchPredictor(nn.Module):
+    def __init__(self, player_size, match_size):
+        super().__init__()
+        self.player_size = player_size
+        self.match_size = match_size
+        self.encoder = PlayerEncoder(player_size)
+        self.final = nn.Sequential(
+            nn.Linear(2 * 64 + match_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
 
-                # Create models directory if it doesn't exist
-                os.makedirs('models', exist_ok=True)
+    def forward(self, x):
+        p1 = x[:, :self.player_size]
+        p2 = x[:, self.player_size:2 * self.player_size]
+        match = x[:, 2 * self.player_size:2 * self.player_size + self.match_size]
 
-                # Save the entire model as pickle
-                model_data = {
-                    'model': model,
-                    'input_size': input_size,
-                    'hidden_sizes': [128, 64, 32],
-                    'epoch': num_epochs,
-                    'device': str(device),
-                    'optimizer' : optimizer,
-                    'scheduler' : scheduler
-                }
+        e1 = self.encoder(p1)
+        e2 = self.encoder(p2)
 
-                with open(f'models/atp_match_predictor_a{arch_idx}_o{opt_idx}_s{sched_idx}.pkl', 'wb') as f:
-                    pickle.dump(model_data, f)
+        combined = torch.cat([
+            torch.abs(e1 - e2),
+            e1 * e2,
+            match
+        ], dim=1)
 
-                print(f"Model saved as pickle to models/atp_match_predictor.pkl")
+        return self.final(combined).squeeze(1)
+
+
+class WideAndDeep(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.wide = nn.Linear(input_size, 1)
+        self.deep = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, x):
+        return (self.wide(x) + self.deep(x)).squeeze(1)
+
+
+# =========================
+# Feature size helper
+# =========================
+
+def get_feature_block_sizes(dataset):
+    ct = dataset.pipeline.named_steps['column_transformer']
+
+    winner_size = (
+        len(ct.named_transformers_['winner_cat'].get_feature_names_out()) +
+        len(ct.named_transformers_['winner_ioc'].get_feature_names_out()) +
+        len(dataset.winner_numerical)
+    )
+
+    loser_size = (
+        len(ct.named_transformers_['loser_cat'].get_feature_names_out()) +
+        len(ct.named_transformers_['loser_ioc'].get_feature_names_out()) +
+        len(dataset.loser_numerical)
+    )
+
+    match_size = len(ct.named_transformers_['match_cat'].get_feature_names_out())
+    total = winner_size + loser_size + match_size
+
+    return winner_size, loser_size, match_size, total
+
+
+# =========================
+# Training loop
+# =========================
+
+def train_model(model, train_loader, dev_loader, device, epochs=50):
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+    best_acc = 0
+    patience, pat = 50, 0
+
+    for epoch in range(epochs):
+        model.train()
+        loss_sum = 0
+
+        for batch in train_loader:
+            x = batch['features'].to(device)
+            y = batch['target'].float().to(device)
+
+            logits = model(x)
+            loss = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+
+        model.eval()
+        correct = total = 0
+
+        with torch.no_grad():
+            for batch in dev_loader:
+                x = batch['features'].to(device)
+                y = batch['target'].to(device)
+
+                preds = (torch.sigmoid(model(x)) > 0.5).long()
+                correct += (preds == y).sum().item()
+                total += y.size(0)
+
+        acc = 100 * correct / total
+        print(f"Epoch {epoch+1:02d} | Loss {loss_sum/len(train_loader):.4f} | Dev Acc {acc:.2f}%")
+
+        if acc > best_acc:
+            best_acc = acc
+            pat = 0
+        else:
+            pat += 1
+            if pat >= patience:
+                print("Early stopping")
+                break
+
+
+if __name__ == "__main__":
+    dataset = ATPMatchesDataset("data/processed/atp_matches_2000_2024_final.csv")
+
+    train_loader = DataLoader(dataset.TRAIN, batch_size=32, shuffle=True, num_workers=2)
+    dev_loader = DataLoader(dataset.DEV, batch_size=32, shuffle=False, num_workers=2)
+
+    winner_size, loser_size, match_size, input_size = get_feature_block_sizes(dataset)
+
+    assert winner_size == loser_size
+    assert winner_size * 2 + match_size == input_size
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    models = {
+        "DifferenceModel": DifferenceModelBN(winner_size, match_size),
+    }
+
+    for name, model in models.items():
+        print(f"\n🔥 Training {name}")
+        model.to(device)
+        train_model(model, train_loader, dev_loader, device)
