@@ -1,6 +1,4 @@
 import sklearn
-import torch
-from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
@@ -53,10 +51,6 @@ class ATPMatchesDataset:
 
         # Get training data for fitting pipeline
         train_df = self.matches_df.iloc[train_indices]
-
-        winner_hand_unique = np.unique(self.matches_df['winner_hand'].dropna())
-        loser_hand_unique = np.unique(self.matches_df['loser_hand'].dropna())
-        hand_unique = np.unique(np.concatenate([winner_hand_unique, loser_hand_unique]))
 
         surface_unique = np.unique(self.matches_df['surface'].dropna())
         tourney_level_unique = np.unique(self.matches_df['tourney_level'].dropna())
@@ -127,15 +121,14 @@ class ATPMatchesDataset:
         for i in range(n_samples_total):
             if swap_mask[i]:
                 # Swap winner and loser features
-                winner_features = all_transformed_data[i, :winner_total].copy()
-                loser_features = all_transformed_data[i, winner_total:winner_total + loser_total].copy()
+                winner_features = all_transformed_data[i, :winner_num_size].copy()
+                loser_features = all_transformed_data[i, winner_num_size:winner_num_size + loser_num_size].copy()
 
-                swapped_data[i, :winner_total] = loser_features
-                swapped_data[i, winner_total:winner_total + loser_total] = winner_features
+                swapped_data[i, :winner_num_size] = loser_features
+                swapped_data[i, winner_num_size:winner_num_size + loser_num_size] = winner_features
                 # Match features remain unchanged
 
         all_transformed_data = swapped_data
-
 
         # Create subset datasets
         train_dataset = ATPMatchesSubsetDataset(
